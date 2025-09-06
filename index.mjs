@@ -18,7 +18,8 @@ if (THEGRAPH_API_KEY.startsWith('http')) throw new Error('THEGRAPH_API_KEY は�
 if (THEGRAPH_SUBGRAPH_ID.includes('/') || THEGRAPH_SUBGRAPH_ID.startsWith('http'))
   throw new Error('THEGRAPH_SUBGRAPH_ID は ID だけ（subgraphs/id/ を付けない）');
 
-const GRAPH_URL = `https://gateway.thegraph.com/api/${THEGRAPH_API_KEY}/subgraphs/id/${THEGRAPH_SUBGRAPH_ID}`;
+const GRAPH_URL = process.env.GRAPH_URL || `https://gateway.thegraph.com/api/${THEGRAPH_API_KEY}/subgraphs/id/${THEGRAPH_SUBGRAPH_ID}`;
+
 
 // --- helpers ---
 async function graphQL(query, variables = {}) {
