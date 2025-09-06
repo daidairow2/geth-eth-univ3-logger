@@ -1,0 +1,14 @@
+{
+  "name": "geth-eth-univ3-logger",
+  "version": "0.1.0",
+  "type": "module",
+  "scripts": {
+    "start": "node index.mjs",
+    "once": "node index.mjs --once"
+  },
+  "dependencies": {
+    "dotenv": "^16.4.5",
+    "ethers": "^6.13.2",
+    "node-fetch": "^3.3.2"
+  }
+}
