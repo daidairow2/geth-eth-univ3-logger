@@ -5,6 +5,9 @@ import path from 'path';
 import fetch from 'node-fetch';
 import { fileURLToPath } from 'url';
 
+if (THEGRAPH_API_KEY.includes('http')) throw new Error('THEGRAPH_API_KEY には URL ではなく「キー文字列」だけを入れてください');
+if (THEGRAPH_SUBGRAPH_ID.includes('/') || THEGRAPH_SUBGRAPH_ID.startsWith('http')) throw new Error('THEGRAPH_SUBGRAPH_ID には ID だけを入れてください（subgraphs/id/ は不要）');
+
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const dataDir = path.join(__dirname, 'data');
 if (!fs.existsSync(dataDir)) fs.mkdirSync(dataDir);
