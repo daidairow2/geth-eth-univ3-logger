@@ -1,0 +1,237 @@
+name: logger
+on:
+  schedule:
+    - cron: "*/15 * * * *"   # 15分ごと（UTC）。日本時間は+9時間
+  workflow_dispatch: {}       # 手動実行ボタン
+
+permissions:
+  contents: write
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # --- 初回だけ: プロジェクト一式を自動生成してコミット ---
+      - name: Bootstrap project files
+        run: |
+          set -e
+          mkdir -p lib charts data
+          if [ ! -f package.json ]; then
+            cat > package.json <<'EOF'
+            {
+              "name": "geth-eth-univ3-logger",
+              "version": "0.1.0",
+              "type": "module",
+              "scripts": {
+                "start": "node index.mjs",
+                "once": "node index.mjs --once"
+              },
+              "dependencies": {
+                "dotenv": "^16.4.5",
+                "ethers": "^6.13.2",
+                "node-fetch": "^3.3.2"
+              }
+            }
+            EOF
+          fi
+          if [ ! -f lib/erc20-abi.mjs ]; then
+            cat > lib/erc20-abi.mjs <<'EOF'
+            ["function decimals() view returns (uint8)","function symbol() view returns (string)","function balanceOf(address) view returns (uint256)","function totalSupply() view returns (uint256)"]
+            EOF
+          fi
+          if [ ! -f lib/uniswap.mjs ]; then
+            cat > lib/uniswap.mjs <<'EOF'
+            import { Contract } from "ethers";
+            import erc20 from "./erc20-abi.mjs" assert { type: "json" };
+
+            export const V3_ABI = [
+              "function slot0() view returns (uint160 sqrtPriceX96,int24 tick,uint16 observationIndex,uint16 observationCardinality,uint16 observationCardinalityNext,uint8 feeProtocol,bool unlocked)",
+              "function token0() view returns (address)",
+              "function token1() view returns (address)"
+            ];
+
+            export async function getPoolState(provider, poolAddr) {
+              const pool = new Contract(poolAddr, V3_ABI, provider);
+              const [slot0, token0, token1] = await Promise.all([pool.slot0(), pool.token0(), pool.token1()]);
+              return { slot0, token0, token1 };
+            }
+
+            export async function getDecimals(provider, tokenAddr) {
+              const token = new Contract(tokenAddr, erc20, provider);
+              const [dec, sym] = await Promise.all([token.decimals(), token.symbol()]);
+              return { decimals: Number(dec), symbol: sym };
+            }
+
+            export function priceFromSqrtPriceX96(sqrtPriceX96, dec0, dec1) {
+              // price(token0 in token1) = (sqrtP^2 / 2^192) * 10^(dec0-dec1)
+              const bn = BigInt(sqrtPriceX96);
+              const num = bn * bn;         // Q192
+              const q192 = 2n ** 192n;
+              const ratio = Number(num) / Number(q192);
+              return ratio * Math.pow(10, dec0 - dec1);
+            }
+            EOF
+          fi
+          if [ ! -f lib/graph.mjs ]; then
+            cat > lib/graph.mjs <<'EOF'
+            import fetch from "node-fetch";
+            export function buildGraphURL(apiKey, subgraphId) {
+              if (!apiKey || !subgraphId) throw new Error("Missing THEGRAPH_API_KEY or THEGRAPH_SUBGRAPH_ID");
+              return `https://gateway.thegraph.com/api/${apiKey}/subgraphs/id/${subgraphId}`;
+            }
+            export async function graphQL(url, query, variables = {}) {
+              const res = await fetch(url, { method:"POST", headers:{ "content-type":"application/json" }, body: JSON.stringify({ query, variables }) });
+              if (!res.ok) throw new Error(`GraphQL HTTP ${res.status}: ${await res.text()}`);
+              const json = await res.json();
+              if (json.errors) throw new Error(JSON.stringify(json.errors, null, 2));
+              return json.data;
+            }
+            export async function fetchPool24h(url, poolId, nowSec = Math.floor(Date.now()/1000)) {
+              const startTime = nowSec - 24*3600;
+              const q = `
+                query Pool24h($poolId: ID!, $start: Int!) {
+                  pool(id: $poolId) { id feeTier totalValueLockedUSD token0 { symbol decimals } token1 { symbol decimals } }
+                  poolHourDatas(where: { pool: $poolId, periodStartUnix_gte: $start }, orderBy: periodStartUnix, orderDirection: asc) {
+                    periodStartUnix volumeUSD tvlUSD
+                  }
+                }`;
+              const d = await graphQL(url, q, { poolId: poolId.toLowerCase(), start: startTime });
+              const vols = (d.poolHourDatas||[]).map(h=>Number(h.volumeUSD));
+              const tvls = (d.poolHourDatas||[]).map(h=>Number(h.tvlUSD));
+              const sum24h = vols.reduce((a,b)=>a+b,0);
+              const lastTvl = tvls.length ? tvls[tvls.length-1] : Number(d.pool?.totalValueLockedUSD ?? 0);
+              return { meta: d.pool, volume24hUSD: sum24h, tvlUSD: lastTvl };
+            }
+            EOF
+          fi
+          if [ ! -f index.mjs ]; then
+            cat > index.mjs <<'EOF'
+            import 'dotenv/config';
+            import { JsonRpcProvider } from "ethers";
+            import fs from "fs"; import path from "path"; import { fileURLToPath } from "url";
+            import { getPoolState, getDecimals, priceFromSqrtPriceX96 } from "./lib/uniswap.mjs";
+            import { buildGraphURL, fetchPool24h } from "./lib/graph.mjs";
+
+            const __dirname = path.dirname(fileURLToPath(import.meta.url));
+            const dataDir = path.join(__dirname, "data");
+            if (!fs.existsSync(dataDir)) fs.mkdirSync(dataDir);
+
+            const { RPC_URL, GETH_ETH_POOL, ETH_USDC_V3_POOL, TOKEN0_DECIMALS, TOKEN1_DECIMALS,
+                    THEGRAPH_API_KEY, THEGRAPH_SUBGRAPH_ID, INTERVAL_SEC } = process.env;
+
+            if (!RPC_URL) throw new Error("Set RPC_URL");
+            const provider = new JsonRpcProvider(RPC_URL);
+
+            const priceCSV = path.join(dataDir, "geth_eth_price.csv");
+            const statsCSV = path.join(dataDir, "ethusdc_stats.csv");
+
+            function appendCSV(file, header, row) {
+              if (!fs.existsSync(file)) fs.writeFileSync(file, header.join(",") + "\n");
+              fs.appendFileSync(file, row.join(",") + "\n");
+            }
+
+            async function logGethEth() {
+              if (!GETH_ETH_POOL || GETH_ETH_POOL === "0x0000000000000000000000000000000000000000") return;
+              const ts = new Date().toISOString();
+              const { slot0, token0, token1 } = await getPoolState(provider, GETH_ETH_POOL);
+              const dec0 = Number(TOKEN0_DECIMALS) || (await getDecimals(provider, token0)).decimals;
+              const dec1 = Number(TOKEN1_DECIMALS) || (await getDecimals(provider, token1)).decimals;
+              const price0in1 = priceFromSqrtPriceX96(slot0[0], dec0, dec1);
+              const price1in0 = 1/price0in1;
+              const header = ["timestamp_iso","pool","token0","token1","dec0","dec1","price_token0_in_token1","price_token1_in_token0"];
+              const row = [ts, GETH_ETH_POOL, token0, token1, dec0, dec1, price0in1, price1in0];
+              appendCSV(priceCSV, header, row);
+              console.log(`[gETH/ETH] ${ts} ${price0in1} (${token0}->${token1})`);
+            }
+
+            async function logEthUsdcStats() {
+              if (!ETH_USDC_V3_POOL || !THEGRAPH_API_KEY || !THEGRAPH_SUBGRAPH_ID) return;
+              const ts = new Date().toISOString();
+              const graphURL = buildGraphURL(THEGRAPH_API_KEY, THEGRAPH_SUBGRAPH_ID);
+              const out = await fetchPool24h(graphURL, ETH_USDC_V3_POOL);
+              const header = ["timestamp_iso","pool","feeTier","volume24hUSD","tvlUSD"];
+              const row = [ts, ETH_USDC_V3_POOL, out.meta?.feeTier ?? "", out.volume24hUSD, out.tvlUSD];
+              appendCSV(statsCSV, header, row);
+              console.log(`[ETH/USDC stats] ${ts} vol24h=$${out.volume24hUSD.toFixed(0)} tvl=$${out.tvlUSD.toFixed(0)} fee=${out.meta?.feeTier}`);
+            }
+
+            async function tick(){ await Promise.all([logGethEth(), logEthUsdcStats()]).catch(e => console.error(e.message)); }
+            const once = process.argv.includes("--once");
+            const intervalMs = (Number(INTERVAL_SEC)||300)*1000;
+            await tick(); if (!once) setInterval(tick, intervalMs);
+            EOF
+          fi
+          if [ ! -f charts/dashboard.html ]; then
+            cat > charts/dashboard.html <<'EOF'
+            <!doctype html><html><head><meta charset="utf-8"/><meta name="viewport" content="width=device-width,initial-scale=1"/><title>gETH & Uniswap V3 Stats</title>
+            <style>body{font-family:system-ui,-apple-system,Segoe UI,Roboto,sans-serif;margin:24px}.grid{display:grid;gap:24px;grid-template-columns:1fr}@media(min-width:1000px){.grid{grid-template-columns:1fr 1fr}}.card{border:1px solid #ddd;border-radius:12px;padding:16px;box-shadow:0 2px 8px rgba(0,0,0,.04)}canvas{width:100%;height:340px}.hint{color:#666;font-size:14px}code{background:#f6f8fa;padding:2px 6px;border-radius:6px}</style>
+            </head><body>
+            <h1>gETH/ETH & ETH/USDC (Base, UniV3)</h1>
+            <p class="hint">CSVは <code>/data/</code> に保存されます。GitHub Pages を main / root で有効にすると、このページから読み込めます。</p>
+            <div class="grid">
+              <div class="card"><h3>gETH/ETH ratio (pool slot0)</h3><canvas id="c1"></canvas></div>
+              <div class="card"><h3>ETH/USDC 24h Volume & TVL</h3><canvas id="c2"></canvas></div>
+            </div>
+            <script src="https://cdn.jsdelivr.net/npm/papaparse@5.4.1/papaparse.min.js"></script>
+            <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
+            <script>
+              const p1="/data/geth_eth_price.csv", p2="/data/ethusdc_stats.csv";
+              async function loadCSV(url){return new Promise((res,rej)=>Papa.parse(url,{download:true,header:true,dynamicTyping:true,complete:r=>res(r.data),error:rej}))}
+              function t(x){return new Date(x).getTime()}
+              (async ()=>{
+                try{
+                  const a=await loadCSV(p1), b=await loadCSV(p2);
+                  const C=Chart; const ctx1=document.getElementById("c1").getContext("2d");
+                  new C(ctx1,{type:"line",data:{datasets:[{label:"price_token0_in_token1",parsing:false,data:a.map(r=>({x:t(r.timestamp_iso),y:r.price_token0_in_token1})),pointRadius:0}]},
+                    options:{animation:false,parsing:false,scales:{x:{type:"time",time:{unit:"minute"}},y:{title:{display:true,text:"gETH per ETH (if token0=gETH)"}}}}});
+                  const ctx2=document.getElementById("c2").getContext("2d");
+                  new C(ctx2,{type:"line",data:{datasets:[
+                    {label:"Volume 24h (USD)",parsing:false,yAxisID:"y1",data:b.map(r=>({x:t(r.timestamp_iso),y:r.volume24hUSD})),pointRadius:0},
+                    {label:"TVL (USD)",parsing:false,yAxisID:"y2",data:b.map(r=>({x:t(r.timestamp_iso),y:r.tvlUSD})),pointRadius:0}
+                  ]},options:{animation:false,parsing:false,scales:{x:{type:"time",time:{unit:"minute"}},y1:{type:"linear",position:"left",title:{display:true,text:"Vol 24h (USD)"}},y2:{type:"linear",position:"right",title:{display:true,text:"TVL (USD)"},grid:{drawOnChartArea:false}}}}});
+                }catch(e){document.body.insertAdjacentHTML("beforeend",`<pre style=color:#b00>${e.message}</pre>`)}
+              })();
+            </script></body></html>
+            EOF
+          fi
+          if git status --porcelain | grep -q .; then
+            git config user.name "github-actions[bot]"
+            git config user.email "github-actions[bot]@users.noreply.github.com"
+            git add -A
+            git commit -m "bootstrap project files"
+            git push
+          else
+            echo "No bootstrap changes."
+          fi
+
+      - uses: actions/setup-node@v4
+        with: { node-version: "20" }
+
+      - name: Install dependencies
+        run: npm install
+
+      - name: Write .env for this run
+        run: |
+          cat > .env << 'EOF'
+          RPC_URL=${{ secrets.RPC_URL }}
+          # gETH/WETH pool (optional). Leave empty to skip
+          GETH_ETH_POOL=${{ secrets.GETH_ETH_POOL }}
+          # Base Uniswap V3 WETH/USDC 0.05% (既定)
+          ETH_USDC_V3_POOL=0xd0b53d9277642d899df5c87a3966a349a798f224
+          THEGRAPH_API_KEY=${{ secrets.THEGRAPH_API_KEY }}
+          THEGRAPH_SUBGRAPH_ID=FUbEPQw1oMghy39fwWBFY5fE6MXPXZQtjncQy2cXdrNS
+          INTERVAL_SEC=60
+          EOF
+
+      - name: Run logger once
+        run: node index.mjs --once
+
+      - name: Commit CSVs
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add data/*.csv || true
+          git commit -m "update data $(date -u +'%Y-%m-%dT%H:%M:%SZ')" || echo "no changes"
+          git push
