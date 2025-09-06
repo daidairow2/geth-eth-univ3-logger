@@ -1,27 +1,20 @@
 name: logger
-
 on:
-  schedule: [{ cron: "*/15 * * * *" }] # 15分おき（UTC）
+  schedule: [{ cron: "*/15 * * * *" }]  # 15分ごと（UTC）
   workflow_dispatch: {}
 
 permissions:
   contents: write
 
-# 安定化（並走防止）
 concurrency:
   group: logger
   cancel-in-progress: false
-
-defaults:
-  run:
-    shell: bash
 
 jobs:
   run:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-
       - uses: actions/setup-node@v4
         with:
           node-version: "20"
@@ -32,34 +25,26 @@ jobs:
       - name: Write .env for this run
         run: |
           cat > .env << 'EOF'
-          # Base RPC（Alchemy等）。RPC_URL が無い場合は BASE_RPC_URL を代替で読む
-          RPC_URL=${{ secrets.RPC_URL || secrets.BASE_RPC_URL }}
-
-          # gETH/WETH のプール（任意。未設定なら gETH/ETH レシオはスキップ）
-          GETH_ETH_POOL=${{ secrets.GETH_ETH_POOL }}
-
-          # Base Uniswap v3 WETH/USDC 0.05% プール
+          # Uniswap v3 Base WETH/USDC 0.05% プール（既定）
           ETH_USDC_V3_POOL=0xd0b53d9277642d899df5c87a3966a349a798f224
-
-          # The Graph Gateway API key（任意。未設定なら出来高/TVLはスキップ）
+          # The Graph Gateway の API キー（必須）
           THEGRAPH_API_KEY=${{ secrets.THEGRAPH_API_KEY }}
-
-          # Base の Uniswap v3 サブグラフID（既定値のままでOK）
+          # Uniswap v3 Base のサブグラフID（既定のままでOK）
           THEGRAPH_SUBGRAPH_ID=FUbEPQw1oMghy39fwWBFY5fE6MXPXZQtjncQy2cXdrNS
-
-          # 取得間隔（秒）— Actions は1回だけ実行するので参考値
-          INTERVAL_SEC=60
           EOF
-          echo "=== .env written ==="
-          sed 's/^\(RPC_URL=\).*/\1(***hidden***)/' .env | sed 's/^\(THEGRAPH_API_KEY=\).*/\1(***hidden***)/'
 
       - name: Run logger once
         run: npm run once
 
-      - name: Commit CSVs
+      - name: Ensure data dir & placeholder
+        run: |
+          mkdir -p data
+          [ -f data/.gitkeep ] || echo placeholder > data/.gitkeep
+
+      - name: Commit CSV
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add data/*.csv || true
+          git add data/ethusdc_stats.csv data/.gitkeep || true
           git commit -m "update $(date -u +'%Y-%m-%dT%H:%M:%SZ')" || echo "no changes"
           git push || true
