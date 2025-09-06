@@ -1,0 +1,29 @@
+<!doctype html><html><head><meta charset="utf-8"/><meta name="viewport" content="width=device-width,initial-scale=1"/><title>gETH & UniV3 Stats</title>
+<style>body{font-family:system-ui,-apple-system,Segoe UI,Roboto,sans-serif;margin:24px}.grid{display:grid;gap:24px;grid-template-columns:1fr}@media(min-width:1000px){.grid{grid-template-columns:1fr 1fr}}.card{border:1px solid #ddd;border-radius:12px;padding:16px;box-shadow:0 2px 8px rgba(0,0,0,.04)}canvas{width:100%;height:340px}.hint{color:#666;font-size:14px}code{background:#f6f8fa;padding:2px 6px;border-radius:6px}</style>
+</head><body>
+<h1>gETH/ETH & ETH/USDC (Base, UniV3)</h1>
+<p class="hint">CSVは <code>/data/</code> に生成されます。GitHub Pages を main / root で有効化するとこのページから読み込めます。</p>
+<div class="grid">
+  <div class="card"><h3>gETH/ETH ratio (pool slot0)</h3><canvas id="c1"></canvas></div>
+  <div class="card"><h3>ETH/USDC 24h Volume & TVL</h3><canvas id="c2"></canvas></div>
+</div>
+<script src="https://cdn.jsdelivr.net/npm/papaparse@5.4.1/papaparse.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
+<script>
+  const p1="/data/geth_eth_price.csv", p2="/data/ethusdc_stats.csv";
+  async function loadCSV(url){return new Promise((res,rej)=>Papa.parse(url,{download:true,header:true,dynamicTyping:true,complete:r=>res(r.data),error:rej}))}
+  function t(x){return new Date(x).getTime()}
+  (async ()=>{
+    try{
+      const a=await loadCSV(p1), b=await loadCSV(p2);
+      const C=Chart; const ctx1=document.getElementById("c1").getContext("2d");
+      new C(ctx1,{type:"line",data:{datasets:[{label:"price_token0_in_token1",parsing:false,data:a.map(r=>({x:t(r.timestamp_iso),y:r.price_token0_in_token1})),pointRadius:0}]},
+        options:{animation:false,parsing:false,scales:{x:{type:"time",time:{unit:"minute"}},y:{title:{display:true,text:"gETH per ETH (if token0=gETH)"}}}}});
+      const ctx2=document.getElementById("c2").getContext("2d");
+      new C(ctx2,{type:"line",data:{datasets:[
+        {label:"Volume 24h (USD)",parsing:false,yAxisID:"y1",data:b.map(r=>({x:t(r.timestamp_iso),y:r.volume24hUSD})),pointRadius:0},
+        {label:"TVL (USD)",parsing:false,yAxisID:"y2",data:b.map(r=>({x:t(r.timestamp_iso),y:r.tvlUSD})),pointRadius:0}
+      ]},options:{animation:false,parsing:false,scales:{x:{type:"time",time:{unit:"minute"}},y1:{type:"linear",position:"left",title:{display:true,text:"Vol 24h (USD)"}},y2:{type:"linear",position:"right",title:{display:true,text:"TVL (USD)"},grid:{drawOnChartArea:false}}}}});
+    }catch(e){document.body.insertAdjacentHTML("beforeend",`<pre style=color:#b00>${e.message}</pre>`)}
+  })();
+</script></body></html>
